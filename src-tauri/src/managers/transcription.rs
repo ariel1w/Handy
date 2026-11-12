@@ -1050,8 +1050,8 @@ impl TranscriptionManager {
         // included) stops every run of this transcription.
         let mark = self.engine.cancel_mark();
         self.touch_activity();
-        self.route_model_by_language(&audio);
-        let batch = self.batch_context(&audio)?;
+        let routed = self.route_model_by_language(&audio);
+        let batch = self.batch_context_routed(&audio, routed)?;
         self.transcribe_cpp(mark, batch, audio)
     }
 
@@ -1061,19 +1061,25 @@ impl TranscriptionManager {
     /// With that file present, the language detector picks between the
     /// person's spoken languages before each batch transcription and the
     /// mapped model is loaded if it isn't the one in memory. Any failure
-    /// keeps the loaded model.
-    fn route_model_by_language(&self, audio: &[f32]) {
+    /// keeps the loaded model. Returns the language when it was detected with
+    /// confidence, so the run can pass it to the model as a hint.
+    fn route_model_by_language(&self, audio: &[f32]) -> Option<String> {
+        let (language, confident) = self.route_model_inner(audio)?;
+        confident.then_some(language)
+    }
+
+    fn route_model_inner(&self, audio: &[f32]) -> Option<(String, bool)> {
         let Ok(dir) = crate::portable::app_data_dir(&self.app_handle) else {
-            return;
+            return None;
         };
         let Ok(raw) = std::fs::read_to_string(dir.join("lang_routes.json")) else {
-            return;
+            return None;
         };
         let routes: std::collections::HashMap<String, String> = match serde_json::from_str(&raw) {
             Ok(routes) => routes,
             Err(e) => {
                 warn!("Model routing: lang_routes.json is not valid: {e}");
-                return;
+                return None;
             }
         };
         {
@@ -1085,31 +1091,31 @@ impl TranscriptionManager {
         let settings = get_settings(&self.app_handle);
         let pairs = crate::language_detection::detector_pairs(&settings.spoken_languages);
         if pairs.len() < 2 {
-            return;
+            return None;
         }
         let Some(path) = self.model_manager.language_detector_path() else {
             warn!("Model routing: the language detector isn't downloaded");
-            return;
+            return None;
         };
         let started = Instant::now();
         let speech = self.detection_speech(&settings, audio);
         if speech.len() < 8_000 {
             info!("Model routing: too little speech to detect, keeping the loaded model");
-            return;
+            return None;
         }
         let allowed: Vec<String> = pairs.iter().map(|(_, label)| label.clone()).collect();
         let identified = match self.language_detector.identify(&path, &speech, &allowed) {
             Ok(identified) => identified,
             Err(e) => {
                 warn!("Model routing: detection failed: {e:#}");
-                return;
+                return None;
             }
         };
         let Some((label, p)) = identified.candidates.first().cloned() else {
-            return;
+            return None;
         };
         let Some((language, _)) = pairs.iter().find(|(_, l)| *l == label) else {
-            return;
+            return None;
         };
         let min_p: f32 = std::env::var("HANDY_ROUTE_MIN_P")
             .ok()
@@ -1121,7 +1127,7 @@ impl TranscriptionManager {
             "uncertain"
         };
         let Some(target) = routes.get(key).or_else(|| routes.get(language.as_str())) else {
-            return;
+            return None;
         };
         let current = self.get_current_model();
         info!(
@@ -1130,7 +1136,7 @@ impl TranscriptionManager {
             started.elapsed().as_millis()
         );
         if current.as_deref() == Some(target.as_str()) {
-            return;
+            return Some((language.clone(), key != "uncertain"));
         }
         {
             let mut is_loading = self.is_loading.lock().unwrap();
@@ -1156,12 +1162,20 @@ impl TranscriptionManager {
                 }
             }
         }
+        Some((language.clone(), key != "uncertain"))
     }
 
     /// Waits out any model load, then reads what a batch transcription of
     /// `audio` runs with: the loaded model, the settings, and the language
     /// resolved for it.
     fn batch_context(&self, audio: &[f32]) -> Result<BatchContext> {
+        self.batch_context_routed(audio, None)
+    }
+
+    /// LOCAL PATCH (model routing): `routed` is the language model routing
+    /// detected; it replaces the language plan so the model isn't asked to
+    /// detect it again.
+    fn batch_context_routed(&self, audio: &[f32], routed: Option<String>) -> Result<BatchContext> {
         {
             let mut is_loading = self.is_loading.lock().unwrap();
             while *is_loading {
@@ -1180,8 +1194,23 @@ impl TranscriptionManager {
         let active_model = self
             .get_current_model()
             .unwrap_or_else(|| settings.selected_model.clone());
-        let plan = self.language_plan(&settings, &active_model, &info);
-        let setup = self.setup_for(&info, &settings, &plan, audio);
+        let setup = match routed {
+            Some(language) => {
+                info!("Transcription language: {language} (model routing)");
+                run_setup(
+                    &info,
+                    &settings,
+                    LanguageDecision {
+                        language: Some(language),
+                        source: LanguageSource::Detected,
+                    },
+                )
+            }
+            None => {
+                let plan = self.language_plan(&settings, &active_model, &info);
+                self.setup_for(&info, &settings, &plan, audio)
+            }
+        };
         Ok(BatchContext {
             info,
             settings,

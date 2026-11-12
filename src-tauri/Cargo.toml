@@ -195,7 +195,7 @@ transcribe-cpp = { version = "0.4.0", default-features = false, features = [
 # dir and fails with a symlink collision. Unifying the source removes the dup.
 [patch.crates-io]
 # LOCAL PATCH: engine fork with the opt-in whisper dynamic audio context.
-transcribe-cpp-sys = { git = "https://github.com/ariel1w/transcribe.cpp", rev = "2d3b0ad055fab30dedad69e830b8c962495fb6fe" }
+transcribe-cpp-sys = { git = "https://github.com/ariel1w/transcribe.cpp", rev = "4adfd1727186e9a11ab8f8c9fe80e53669cfcfaf" }
 tao = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
 tao-macros = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
 
