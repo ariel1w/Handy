@@ -12,7 +12,8 @@ use crate::language_detection::speech::speech_head;
 use crate::language_detection::{
     IdentifyError, LanguageDecision, LanguageDetector, LanguageSource, Plan,
 };
-use crate::managers::audio::{create_smoothed_detector, AudioRecordingManager};
+use crate::audio_toolkit::vad::{SpeechScorer, VoiceActivityDetector};
+use crate::managers::audio::{create_detector, create_smoothed_detector, AudioRecordingManager};
 use crate::managers::model::ModelManager;
 use crate::notices::{self, Notice, NoticeCode, NoticeSource};
 use crate::overlay;
@@ -1008,15 +1009,16 @@ impl TranscriptionManager {
             });
         }
 
-        let outcome = match live {
-            Some(outcome) => outcome,
-            None => self.decode_batch(audio)?,
-        };
         let settings = get_settings(&self.app_handle);
-        let language = outcome
-            .setup
-            .spoken_language(outcome.model_detected_language.as_deref());
-        let final_result = finish_text(outcome, &settings);
+        // LOCAL PATCH (model routing): a recording that changes language at a
+        // pause is decoded piece by piece, each by the model of its language.
+        let (language, final_result) = match live {
+            Some(outcome) => finish_outcome(outcome, &settings),
+            None => match self.decode_mixed(&audio, &settings)? {
+                Some(done) => done,
+                None => finish_outcome(self.decode_batch(audio)?, &settings),
+            },
+        };
 
         let translation_note = if settings.translate_to_english {
             " (translated)"
@@ -1074,6 +1076,209 @@ impl TranscriptionManager {
     fn route_model_by_language(&self, audio: &[f32]) -> Option<String> {
         let (language, confident) = self.route_model_inner(audio)?;
         confident.then_some(language)
+    }
+
+    fn read_routes(&self) -> Option<std::collections::HashMap<String, String>> {
+        let dir = crate::portable::app_data_dir(&self.app_handle).ok()?;
+        let raw = std::fs::read_to_string(dir.join("lang_routes.json")).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn wait_for_load(&self) {
+        let mut is_loading = self.is_loading.lock().unwrap();
+        while *is_loading {
+            is_loading = self.loading_condvar.wait(is_loading).unwrap();
+        }
+    }
+
+    /// Loads `target` in place of the loaded model; a failure restores it.
+    fn switch_model(&self, target: &str) {
+        self.wait_for_load();
+        let current = self.get_current_model();
+        if current.as_deref() == Some(target) {
+            return;
+        }
+        let started = Instant::now();
+        *self.is_loading.lock().unwrap() = true;
+        let loaded = self.load_model(target);
+        *self.is_loading.lock().unwrap() = false;
+        self.loading_condvar.notify_all();
+        match loaded {
+            Ok(()) => info!(
+                "Model routing: switched model in {} ms",
+                started.elapsed().as_millis()
+            ),
+            Err(e) => {
+                warn!("Model routing: could not load {target}: {e:#}");
+                if let Some(previous) = current {
+                    if let Err(e) = self.load_model(&previous) {
+                        warn!("Model routing: could not restore {previous}: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// LOCAL PATCH (model routing): the recording cut at its pauses into
+    /// runs of one language each, or `None` when it is all one language (or
+    /// that can not be told), which the single-language path then handles.
+    fn language_groups(
+        &self,
+        settings: &AppSettings,
+        audio: &[f32],
+    ) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+        fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        let pairs = crate::language_detection::detector_pairs(&settings.spoken_languages);
+        if pairs.len() < 2 {
+            return None;
+        }
+        let path = self.model_manager.language_detector_path()?;
+        let started = Instant::now();
+        let mut scorer = create_detector(settings.vad_backend, &self.app_handle).ok()?;
+        let frame = scorer.frame_samples();
+        if frame == 0 {
+            return None;
+        }
+        let whole = audio.len() / frame * frame;
+        let probs = scorer.score(&audio[..whole]).ok()?;
+        let pause_ms: usize = env_or("HANDY_ROUTE_PAUSE_MS", 500);
+        let pause_frames = (pause_ms * 16 / frame).max(1);
+        let mut bounds = vec![0usize];
+        let mut quiet_from: Option<usize> = None;
+        for (i, p) in probs.iter().enumerate() {
+            if *p < 0.5 {
+                quiet_from.get_or_insert(i);
+            } else if let Some(from) = quiet_from.take() {
+                if from > 0 && i - from >= pause_frames {
+                    bounds.push((from + i) / 2 * frame);
+                }
+            }
+        }
+        if bounds.len() == 1 {
+            return None;
+        }
+        bounds.push(audio.len());
+
+        let allowed: Vec<String> = pairs.iter().map(|(_, label)| label.clone()).collect();
+        let min_p: f32 = env_or("HANDY_ROUTE_SEGMENT_MIN_P", 0.8);
+        let min_speech: usize = env_or("HANDY_ROUTE_SEGMENT_MIN_MS", 1000usize) * 16;
+        let window = settings.language_detection_window_samples();
+        let mut segments: Vec<(Option<String>, std::ops::Range<usize>)> = Vec::new();
+        for pair in bounds.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            let mut speech: Vec<f32> = Vec::new();
+            for i in from / frame..to.min(whole) / frame {
+                if probs[i] >= 0.5 && speech.len() < window {
+                    speech.extend_from_slice(&audio[i * frame..(i + 1) * frame]);
+                }
+            }
+            let language = if speech.len() >= min_speech {
+                self.language_detector
+                    .identify(&path, &speech, &allowed)
+                    .ok()
+                    .and_then(|identified| identified.candidates.first().cloned())
+                    .filter(|(_, p)| p.is_finite() && *p >= min_p)
+                    .and_then(|(label, _)| {
+                        pairs
+                            .iter()
+                            .find(|(_, l)| *l == label)
+                            .map(|(language, _)| language.clone())
+                    })
+            } else {
+                None
+            };
+            segments.push((language, from..to));
+        }
+        // A piece too short or too unsure takes the language next to it.
+        let mut near: Option<String> = None;
+        for segment in segments.iter_mut() {
+            match &segment.0 {
+                Some(language) => near = Some(language.clone()),
+                None => segment.0 = near.clone(),
+            }
+        }
+        near = None;
+        for segment in segments.iter_mut().rev() {
+            match &segment.0 {
+                Some(language) => near = Some(language.clone()),
+                None => segment.0 = near.clone(),
+            }
+        }
+        let mut groups: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+        for (language, range) in segments {
+            let language = language?;
+            match groups.last_mut() {
+                Some((last, span)) if *last == language => span.end = range.end,
+                _ => groups.push((language, range)),
+            }
+        }
+        if groups.len() < 2 {
+            return None;
+        }
+        info!(
+            "Model routing: mixed recording, {} ({} ms)",
+            groups
+                .iter()
+                .map(|(language, range)| format!(
+                    "{language} {:.1}s",
+                    range.len() as f64 / 16_000.0
+                ))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            started.elapsed().as_millis()
+        );
+        Some(groups)
+    }
+
+    /// LOCAL PATCH (model routing): decodes a recording that changes language
+    /// at a pause, each run by the model of its language. The runs of the
+    /// loaded model go first, so there is one model switch however many runs.
+    fn decode_mixed(
+        &self,
+        audio: &[f32],
+        settings: &AppSettings,
+    ) -> Result<Option<(LanguageDecision, String)>> {
+        let Some(routes) = self.read_routes() else {
+            return Ok(None);
+        };
+        let Some(groups) = self.language_groups(settings, audio) else {
+            return Ok(None);
+        };
+        if groups
+            .iter()
+            .any(|(language, _)| !routes.contains_key(language))
+        {
+            return Ok(None);
+        }
+        let mark = self.engine.cancel_mark();
+        self.touch_activity();
+        self.wait_for_load();
+        let current = self.get_current_model();
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&i| routes.get(&groups[i].0) != current.as_ref());
+        let mut texts = vec![String::new(); groups.len()];
+        let mut first_language = None;
+        for i in order {
+            let (language, range) = &groups[i];
+            self.switch_model(&routes[language]);
+            let clip = audio[range.clone()].to_vec();
+            let batch = self.batch_context_routed(&clip, Some(language.clone()))?;
+            let outcome = self.transcribe_cpp(mark, batch, clip)?;
+            let (decision, text) = finish_outcome(outcome, settings);
+            if i == 0 {
+                first_language = Some(decision);
+            }
+            texts[i] = text;
+        }
+        let Some(language) = first_language else {
+            return Ok(None);
+        };
+        Ok(Some((language, chunking::join_transcripts(&texts))))
     }
 
     fn routing_configured(&self) -> bool {
@@ -1380,6 +1585,14 @@ struct RunOutcome {
     text: String,
     /// The language the model itself detected, if it reported one.
     model_detected_language: Option<String>,
+}
+
+/// A transcription's language and final text.
+fn finish_outcome(outcome: RunOutcome, settings: &AppSettings) -> (LanguageDecision, String) {
+    let language = outcome
+        .setup
+        .spoken_language(outcome.model_detected_language.as_deref());
+    (language, finish_text(outcome, settings))
 }
 
 /// One transcription's final text: its output language resolved, then
