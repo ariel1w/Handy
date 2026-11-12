@@ -874,6 +874,14 @@ impl TranscriptionManager {
             ModelTraits::of(&info),
             get_settings(&self.app_handle).long_form_chunking,
         );
+        // LOCAL PATCH (model routing): a chunked live decode runs on whatever
+        // model is loaded and never reaches the language router, so with
+        // routes configured the recording is decoded in batch when it stops.
+        let mode = if mode == policy::LiveDecode::Chunked && self.routing_configured() {
+            policy::LiveDecode::None
+        } else {
+            mode
+        };
         let Some(mut session) = LiveSession::begin(self, mode, &info, &model_id) else {
             // Nothing to decode live: the recording is transcribed in batch.
             self.router.clear();
@@ -1066,6 +1074,12 @@ impl TranscriptionManager {
     fn route_model_by_language(&self, audio: &[f32]) -> Option<String> {
         let (language, confident) = self.route_model_inner(audio)?;
         confident.then_some(language)
+    }
+
+    fn routing_configured(&self) -> bool {
+        crate::portable::app_data_dir(&self.app_handle)
+            .map(|dir| dir.join("lang_routes.json").is_file())
+            .unwrap_or(false)
     }
 
     fn route_model_inner(&self, audio: &[f32]) -> Option<(String, bool)> {
