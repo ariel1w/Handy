@@ -28,7 +28,7 @@ jobs:
         run: |
           vcpkg install spirv-headers:x64-windows
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install spirv-headers failed" }
-          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\','/'
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows".Replace([char]92, [char]47)
           $combined = if ($env:CMAKE_PREFIX_PATH) { "$prefix;$env:CMAKE_PREFIX_PATH" } else { $prefix }
           Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$combined"
       - run: bun install
