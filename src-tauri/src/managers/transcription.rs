@@ -1146,107 +1146,144 @@ impl TranscriptionManager {
         }
         let whole = audio.len() / frame * frame;
         let probs = scorer.score(&audio[..whole]).ok()?;
-        let quiet_p: f32 = env_or("HANDY_ROUTE_QUIET_P", 0.5);
-        let pause_ms: usize = env_or("HANDY_ROUTE_PAUSE_MS", 150);
-        let pause_frames = (pause_ms * 16 / frame).max(1);
-        let min_p: f32 = env_or("HANDY_ROUTE_SEGMENT_MIN_P", 0.8);
-        let min_speech: usize = env_or("HANDY_ROUTE_SEGMENT_MIN_MS", 1000usize) * 16;
-        // Every pause is a place the language may change.
-        let mut cuts: Vec<usize> = Vec::new();
-        let mut quiet_from: Option<usize> = None;
-        for (i, p) in probs.iter().enumerate() {
-            if *p < quiet_p {
-                quiet_from.get_or_insert(i);
-            } else if let Some(from) = quiet_from.take() {
-                if from > 0 && i - from >= pause_frames {
-                    cuts.push((from + i) / 2 * frame);
-                }
-            }
-        }
-        let speech_in = |from: usize, to: usize| {
-            probs[from / frame..to.min(whole) / frame]
-                .iter()
-                .filter(|p| **p >= quiet_p)
-                .count()
-                * frame
-        };
-        // A piece ends at the first pause after it holds enough speech to
-        // tell its language; a short tail joins the piece before it.
-        let mut bounds = vec![0usize];
-        let mut last = 0usize;
-        for cut in cuts {
-            if speech_in(last, cut) >= min_speech {
-                bounds.push(cut);
-                last = cut;
-            }
-        }
-        if bounds.len() > 1 && speech_in(last, whole) < min_speech {
-            bounds.pop();
-        }
-        if bounds.len() == 1 {
+        // The spoken part, without the silence before and after it.
+        let lo = probs.iter().position(|p| *p >= 0.5)? * frame;
+        let hi = (probs.iter().rposition(|p| *p >= 0.5)? + 1) * frame;
+        let win: usize = env_or("HANDY_ROUTE_WIN_MS", 1200usize) * 16;
+        let hop: usize = (env_or("HANDY_ROUTE_HOP_MS", 300usize) * 16).max(frame);
+        let min_p: f32 = env_or("HANDY_ROUTE_SEGMENT_MIN_P", 0.75);
+        let min_run: usize = env_or("HANDY_ROUTE_MIN_RUN", 2usize);
+        if hi <= lo || hi - lo < 2 * win {
             return None;
         }
-        bounds.push(audio.len());
-
         let allowed: Vec<String> = pairs.iter().map(|(_, label)| label.clone()).collect();
-        let window = settings.language_detection_window_samples();
-        let mut segments: Vec<(Option<String>, std::ops::Range<usize>)> = Vec::new();
-        let mut heard: Vec<String> = Vec::new();
-        for pair in bounds.windows(2) {
-            let (from, to) = (pair[0], pair[1]);
-            let mut speech: Vec<f32> = Vec::new();
-            for i in from / frame..to.min(whole) / frame {
-                if probs[i] >= quiet_p && speech.len() < window {
-                    speech.extend_from_slice(&audio[i * frame..(i + 1) * frame]);
-                }
-            }
-            let top = self
-                .language_detector
-                .identify(&path, &speech, &allowed)
+        let identify = |from: usize, to: usize| -> Option<(String, f32)> {
+            self.language_detector
+                .identify(&path, &audio[from..to], &allowed)
                 .ok()
-                .and_then(|identified| identified.candidates.first().cloned());
-            heard.push(match &top {
-                Some((label, p)) => format!(
-                    "{:.1}s {label} {:.0}%",
-                    (to - from) as f64 / 16_000.0,
-                    p * 100.0
-                ),
-                None => format!("{:.1}s ?", (to - from) as f64 / 16_000.0),
-            });
-            let language = top
-                .filter(|(_, p)| p.is_finite() && *p >= min_p)
-                .and_then(|(label, _)| {
-                    pairs
-                        .iter()
-                        .find(|(_, l)| *l == label)
-                        .map(|(language, _)| language.clone())
-                });
-            segments.push((language, from..to));
+                .and_then(|identified| identified.candidates.first().cloned())
+                .filter(|(_, p)| p.is_finite())
+        };
+        let name = |label: &str| -> Option<String> {
+            pairs
+                .iter()
+                .find(|(_, l)| l == label)
+                .map(|(language, _)| language.clone())
+        };
+
+        // Three quick listens: start, middle, end. All sure of one language
+        // means there is nothing to split.
+        let probe = (env_or("HANDY_ROUTE_PROBE_MS", 1500usize) * 16).min(hi - lo);
+        let middle = lo + (hi - lo - probe) / 2;
+        let probes = [
+            identify(lo, lo + probe),
+            identify(middle, middle + probe),
+            identify(hi - probe, hi),
+        ];
+        let sure: Vec<&String> = probes
+            .iter()
+            .filter_map(|probe| probe.as_ref())
+            .filter(|(_, p)| *p >= min_p)
+            .map(|(label, _)| label)
+            .collect();
+        if sure.len() == probes.len() && sure.iter().all(|label| *label == sure[0]) {
+            return None;
         }
-        info!("Model routing: pieces {}", heard.join(" | "));
-        // A piece too short or too unsure takes the language next to it.
+
+        // Listen along the whole recording in overlapping windows.
+        let mut starts: Vec<usize> = Vec::new();
+        let mut at = lo;
+        while at + win <= hi {
+            starts.push(at);
+            at += hop;
+        }
+        let heard: Vec<Option<(String, f32)>> = starts
+            .iter()
+            .map(|start| identify(*start, start + win))
+            .collect();
+        info!(
+            "Model routing: windows {}",
+            heard
+                .iter()
+                .map(|h| match h {
+                    Some((label, p)) => format!("{label}{:.0}", p * 100.0),
+                    None => "?".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut labels: Vec<Option<String>> = heard
+            .into_iter()
+            .map(|h| h.filter(|(_, p)| *p >= min_p).and_then(|(label, _)| name(&label)))
+            .collect();
+        // An unsure window takes the language next to it.
         let mut near: Option<String> = None;
-        for segment in segments.iter_mut() {
-            match &segment.0 {
-                Some(language) => near = Some(language.clone()),
-                None => segment.0 = near.clone(),
+        for label in labels.iter_mut() {
+            if label.is_some() {
+                near = label.clone();
+            } else {
+                *label = near.clone();
             }
         }
         near = None;
-        for segment in segments.iter_mut().rev() {
-            match &segment.0 {
-                Some(language) => near = Some(language.clone()),
-                None => segment.0 = near.clone(),
+        for label in labels.iter_mut().rev() {
+            if label.is_some() {
+                near = label.clone();
+            } else {
+                *label = near.clone();
             }
         }
+        let mut labels: Vec<String> = labels.into_iter().collect::<Option<Vec<_>>>()?;
+        // A language heard in fewer than `min_run` windows in a row is a
+        // mishearing: it takes the language around it.
+        for _ in 0..labels.len() {
+            let mut changed = false;
+            let mut i = 0;
+            while i < labels.len() {
+                let mut j = i;
+                while j < labels.len() && labels[j] == labels[i] {
+                    j += 1;
+                }
+                if j - i < min_run && (i > 0 || j < labels.len()) {
+                    let other = if i > 0 {
+                        labels[i - 1].clone()
+                    } else {
+                        labels[j].clone()
+                    };
+                    for label in &mut labels[i..j] {
+                        *label = other.clone();
+                    }
+                    changed = true;
+                }
+                i = j;
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Each change is cut at the quietest spot of the stretch where the
+        // two languages' windows overlap.
+        let energy = |i: usize| -> f32 {
+            audio[i * frame..((i + 2) * frame).min(audio.len())]
+                .iter()
+                .map(|v| v * v)
+                .sum()
+        };
         let mut groups: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-        for (language, range) in segments {
-            let language = language?;
-            match groups.last_mut() {
-                Some((last, span)) if *last == language => span.end = range.end,
-                _ => groups.push((language, range)),
+        let mut from = 0usize;
+        for i in 0..labels.len() - 1 {
+            if labels[i] == labels[i + 1] {
+                continue;
             }
+            let (a, b) = (starts[i + 1] / frame, (starts[i] + win) / frame);
+            let quietest = (a..b.max(a + 1))
+                .min_by(|x, y| energy(*x).total_cmp(&energy(*y)))
+                .unwrap_or(a);
+            let cut = ((quietest + 1) * frame).min(audio.len());
+            groups.push((labels[i].clone(), from..cut));
+            from = cut;
         }
+        groups.push((labels[labels.len() - 1].clone(), from..audio.len()));
         if groups.len() < 2 {
             return None;
         }
