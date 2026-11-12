@@ -26,6 +26,18 @@ fn detector_labels() -> &'static [String] {
         .unwrap_or_default()
 }
 
+/// LOCAL PATCH (model routing): each of `languages` the detector knows, as
+/// `(language, detector label)`.
+pub fn detector_pairs(languages: &[String]) -> Vec<(String, String)> {
+    let labels = detector_labels();
+    languages
+        .iter()
+        .filter_map(|language| {
+            policy::detector_label(labels, language).map(|label| (language.clone(), label))
+        })
+        .collect()
+}
+
 fn model_languages(model: Option<&ModelInfo>, streaming: bool) -> ModelLanguages<'_> {
     ModelLanguages {
         languages: model

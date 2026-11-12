@@ -1050,8 +1050,112 @@ impl TranscriptionManager {
         // included) stops every run of this transcription.
         let mark = self.engine.cancel_mark();
         self.touch_activity();
+        self.route_model_by_language(&audio);
         let batch = self.batch_context(&audio)?;
         self.transcribe_cpp(mark, batch, audio)
+    }
+
+    /// LOCAL PATCH (model routing): `<app data>/lang_routes.json` maps a spoken
+    /// language to the model that should transcribe it, e.g.
+    /// `{"en": "<model id>", "he": "<model id>", "uncertain": "<model id>"}`.
+    /// With that file present, the language detector picks between the
+    /// person's spoken languages before each batch transcription and the
+    /// mapped model is loaded if it isn't the one in memory. Any failure
+    /// keeps the loaded model.
+    fn route_model_by_language(&self, audio: &[f32]) {
+        let Ok(dir) = crate::portable::app_data_dir(&self.app_handle) else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(dir.join("lang_routes.json")) else {
+            return;
+        };
+        let routes: std::collections::HashMap<String, String> = match serde_json::from_str(&raw) {
+            Ok(routes) => routes,
+            Err(e) => {
+                warn!("Model routing: lang_routes.json is not valid: {e}");
+                return;
+            }
+        };
+        {
+            let mut is_loading = self.is_loading.lock().unwrap();
+            while *is_loading {
+                is_loading = self.loading_condvar.wait(is_loading).unwrap();
+            }
+        }
+        let settings = get_settings(&self.app_handle);
+        let pairs = crate::language_detection::detector_pairs(&settings.spoken_languages);
+        if pairs.len() < 2 {
+            return;
+        }
+        let Some(path) = self.model_manager.language_detector_path() else {
+            warn!("Model routing: the language detector isn't downloaded");
+            return;
+        };
+        let started = Instant::now();
+        let speech = self.detection_speech(&settings, audio);
+        if speech.len() < 8_000 {
+            info!("Model routing: too little speech to detect, keeping the loaded model");
+            return;
+        }
+        let allowed: Vec<String> = pairs.iter().map(|(_, label)| label.clone()).collect();
+        let identified = match self.language_detector.identify(&path, &speech, &allowed) {
+            Ok(identified) => identified,
+            Err(e) => {
+                warn!("Model routing: detection failed: {e:#}");
+                return;
+            }
+        };
+        let Some((label, p)) = identified.candidates.first().cloned() else {
+            return;
+        };
+        let Some((language, _)) = pairs.iter().find(|(_, l)| *l == label) else {
+            return;
+        };
+        let min_p: f32 = std::env::var("HANDY_ROUTE_MIN_P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.7);
+        let key = if p.is_finite() && p >= min_p {
+            language.as_str()
+        } else {
+            "uncertain"
+        };
+        let Some(target) = routes.get(key).or_else(|| routes.get(language.as_str())) else {
+            return;
+        };
+        let current = self.get_current_model();
+        info!(
+            "Model routing: {language} {:.0}% ({key}, {} ms) -> {target}",
+            p * 100.0,
+            started.elapsed().as_millis()
+        );
+        if current.as_deref() == Some(target.as_str()) {
+            return;
+        }
+        {
+            let mut is_loading = self.is_loading.lock().unwrap();
+            *is_loading = true;
+        }
+        let loaded = self.load_model(target);
+        {
+            let mut is_loading = self.is_loading.lock().unwrap();
+            *is_loading = false;
+            self.loading_condvar.notify_all();
+        }
+        match loaded {
+            Ok(()) => info!(
+                "Model routing: switched model in {} ms",
+                started.elapsed().as_millis()
+            ),
+            Err(e) => {
+                warn!("Model routing: could not load {target}: {e:#}");
+                if let Some(previous) = current {
+                    if let Err(e) = self.load_model(&previous) {
+                        warn!("Model routing: could not restore {previous}: {e:#}");
+                    }
+                }
+            }
+        }
     }
 
     /// Waits out any model load, then reads what a batch transcription of
