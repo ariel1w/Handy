@@ -1187,7 +1187,12 @@ impl TranscriptionManager {
             .map(|(label, _)| label)
             .collect();
         if sure.len() == probes.len() && sure.iter().all(|label| *label == sure[0]) {
-            return None;
+            let language = name(sure[0])?;
+            info!(
+                "Model routing: {language} throughout ({} ms)",
+                started.elapsed().as_millis()
+            );
+            return Some(vec![(language, 0..audio.len())]);
         }
 
         // Listen along the whole recording in overlapping windows.
@@ -1199,7 +1204,14 @@ impl TranscriptionManager {
         }
         let heard: Vec<Option<(String, f32)>> = starts
             .iter()
-            .map(|start| identify(*start, start + win))
+            .map(|start| {
+                let frames = &probs[start / frame..(start + win) / frame];
+                let spoken = frames.iter().filter(|p| **p >= 0.5).count();
+                if spoken * 10 < frames.len() * 6 {
+                    return None;
+                }
+                identify(*start, start + win)
+            })
             .collect();
         info!(
             "Model routing: windows {}",
@@ -1284,9 +1296,6 @@ impl TranscriptionManager {
             from = cut;
         }
         groups.push((labels[labels.len() - 1].clone(), from..audio.len()));
-        if groups.len() < 2 {
-            return None;
-        }
         info!(
             "Model routing: mixed recording, {} ({} ms)",
             groups
