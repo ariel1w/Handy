@@ -1146,18 +1146,42 @@ impl TranscriptionManager {
         }
         let whole = audio.len() / frame * frame;
         let probs = scorer.score(&audio[..whole]).ok()?;
-        let pause_ms: usize = env_or("HANDY_ROUTE_PAUSE_MS", 500);
+        let quiet_p: f32 = env_or("HANDY_ROUTE_QUIET_P", 0.5);
+        let pause_ms: usize = env_or("HANDY_ROUTE_PAUSE_MS", 150);
         let pause_frames = (pause_ms * 16 / frame).max(1);
-        let mut bounds = vec![0usize];
+        let min_p: f32 = env_or("HANDY_ROUTE_SEGMENT_MIN_P", 0.8);
+        let min_speech: usize = env_or("HANDY_ROUTE_SEGMENT_MIN_MS", 1000usize) * 16;
+        // Every pause is a place the language may change.
+        let mut cuts: Vec<usize> = Vec::new();
         let mut quiet_from: Option<usize> = None;
         for (i, p) in probs.iter().enumerate() {
-            if *p < 0.5 {
+            if *p < quiet_p {
                 quiet_from.get_or_insert(i);
             } else if let Some(from) = quiet_from.take() {
                 if from > 0 && i - from >= pause_frames {
-                    bounds.push((from + i) / 2 * frame);
+                    cuts.push((from + i) / 2 * frame);
                 }
             }
+        }
+        let speech_in = |from: usize, to: usize| {
+            probs[from / frame..to.min(whole) / frame]
+                .iter()
+                .filter(|p| **p >= quiet_p)
+                .count()
+                * frame
+        };
+        // A piece ends at the first pause after it holds enough speech to
+        // tell its language; a short tail joins the piece before it.
+        let mut bounds = vec![0usize];
+        let mut last = 0usize;
+        for cut in cuts {
+            if speech_in(last, cut) >= min_speech {
+                bounds.push(cut);
+                last = cut;
+            }
+        }
+        if bounds.len() > 1 && speech_in(last, whole) < min_speech {
+            bounds.pop();
         }
         if bounds.len() == 1 {
             return None;
@@ -1165,35 +1189,41 @@ impl TranscriptionManager {
         bounds.push(audio.len());
 
         let allowed: Vec<String> = pairs.iter().map(|(_, label)| label.clone()).collect();
-        let min_p: f32 = env_or("HANDY_ROUTE_SEGMENT_MIN_P", 0.8);
-        let min_speech: usize = env_or("HANDY_ROUTE_SEGMENT_MIN_MS", 1000usize) * 16;
         let window = settings.language_detection_window_samples();
         let mut segments: Vec<(Option<String>, std::ops::Range<usize>)> = Vec::new();
+        let mut heard: Vec<String> = Vec::new();
         for pair in bounds.windows(2) {
             let (from, to) = (pair[0], pair[1]);
             let mut speech: Vec<f32> = Vec::new();
             for i in from / frame..to.min(whole) / frame {
-                if probs[i] >= 0.5 && speech.len() < window {
+                if probs[i] >= quiet_p && speech.len() < window {
                     speech.extend_from_slice(&audio[i * frame..(i + 1) * frame]);
                 }
             }
-            let language = if speech.len() >= min_speech {
-                self.language_detector
-                    .identify(&path, &speech, &allowed)
-                    .ok()
-                    .and_then(|identified| identified.candidates.first().cloned())
-                    .filter(|(_, p)| p.is_finite() && *p >= min_p)
-                    .and_then(|(label, _)| {
-                        pairs
-                            .iter()
-                            .find(|(_, l)| *l == label)
-                            .map(|(language, _)| language.clone())
-                    })
-            } else {
-                None
-            };
+            let top = self
+                .language_detector
+                .identify(&path, &speech, &allowed)
+                .ok()
+                .and_then(|identified| identified.candidates.first().cloned());
+            heard.push(match &top {
+                Some((label, p)) => format!(
+                    "{:.1}s {label} {:.0}%",
+                    (to - from) as f64 / 16_000.0,
+                    p * 100.0
+                ),
+                None => format!("{:.1}s ?", (to - from) as f64 / 16_000.0),
+            });
+            let language = top
+                .filter(|(_, p)| p.is_finite() && *p >= min_p)
+                .and_then(|(label, _)| {
+                    pairs
+                        .iter()
+                        .find(|(_, l)| *l == label)
+                        .map(|(language, _)| language.clone())
+                });
             segments.push((language, from..to));
         }
+        info!("Model routing: pieces {}", heard.join(" | "));
         // A piece too short or too unsure takes the language next to it.
         let mut near: Option<String> = None;
         for segment in segments.iter_mut() {
